@@ -115,6 +115,81 @@ test('authentication failure or timeout does not continue to hostname verificati
   }
 });
 
+test('SSH exit 255 is retried once with the same target and interactive authentication', () => {
+  let attempts = 0, inspections = 0;
+  const logs = [];
+  const result = prepareComputeSsh(options, {
+    files: {
+      lstatSync: () => { inspections++; throw Object.assign(new Error('absent'), { code: 'ENOENT' }); },
+      unlinkSync: () => assert.fail('no socket to remove'),
+    },
+    execute: (_file, args, settings) => {
+      assert.ok(!args.includes('exit'));
+      if (args.includes('-G')) return { status: 0, stdout: config };
+      if (args.includes('-MNf')) {
+        assert.equal(settings.stdio, 'inherit');
+        assert.ok(args.includes('StrictHostKeyChecking=ask'));
+        assert.equal(args.at(-1), 'gl-compute');
+        return { status: ++attempts === 1 ? 255 : 0 };
+      }
+      return { status: 0 };
+    },
+    remote: () => ({ body: 'gl1502.arc-ts.umich.edu' }),
+    progress: line => logs.push(line),
+  });
+  assert.equal(result.ready, true);
+  assert.equal(attempts, 2);
+  assert.equal(inspections, 2);
+  assert.ok(logs.some(line => line.includes('Retrying once')));
+});
+
+test('repeated SSH failure is bounded, and timeout or interruption is never retried', () => {
+  for (const failure of [
+    { status: 255 },
+    { status: null, error: { code: 'ETIMEDOUT' } },
+    { status: null, signal: 'SIGINT' },
+    { status: 130 },
+  ]) {
+    let attempts = 0;
+    assert.throws(() => prepareComputeSsh(options, {
+      files: { lstatSync: () => { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); } },
+      execute: (_file, args) => {
+        if (args.includes('-G')) return { status: 0, stdout: config };
+        assert.ok(args.includes('-MNf'));
+        attempts++;
+        return failure;
+      },
+      remote: () => assert.fail('must not verify after failed authentication'),
+    }), { code: 'SSH_PREPARE_FAILED' });
+    assert.equal(attempts, failure.status === 255 ? 2 : 1);
+  }
+});
+
+test('socket left by the failed attempt is checked and cleaned before retry', () => {
+  let attempts = 0, removed = false;
+  const path = '/home/jason/.ssh/cm-token';
+  prepareComputeSsh(options, {
+    files: {
+      lstatSync: () => {
+        if (!attempts) throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+        return { dev: 1, ino: 10, uid: process.getuid(), isSocket: () => true };
+      },
+      unlinkSync: checked => { assert.equal(checked, path); removed = true; },
+    },
+    execute: (_file, args) => {
+      if (args.includes('-G')) return { status: 0, stdout: config };
+      if (args.includes('-S')) return { status: 255, stderr: `Control socket connect(${path}): Connection refused` };
+      if (args.includes('-MNf')) {
+        if (++attempts === 1) return { status: 255 };
+        assert.equal(removed, true);
+      }
+      return { status: 0 };
+    },
+    remote: () => ({ body: 'gl1502' }),
+  });
+  assert.equal(attempts, 2);
+});
+
 test('connection to an unexpected node is rejected and existing connections are not killed', () => {
   assert.throws(() => prepareComputeSsh(options, {
     execute: (_file, args) => { assert.ok(!args.includes('exit')); return { status: 0, stdout: config }; },

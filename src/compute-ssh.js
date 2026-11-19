@@ -50,9 +50,18 @@ export function prepareComputeSsh(options, { execute = spawnSync, remote = runRe
   }
   removeStaleSocket(fields.get('controlpath'), args, { execute, files, progress });
   progress(`Authenticate gl-compute (${options.node}) in this WSL terminal. Verify any new host fingerprint against a trusted cluster record before accepting it.`);
-  const master = execute('ssh', [...args, '-o', 'StrictHostKeyChecking=ask', '-MNf', 'gl-compute'], {
+  const authenticate = () => execute('ssh', [...args, '-o', 'StrictHostKeyChecking=ask', '-MNf', 'gl-compute'], {
     stdio: 'inherit', timeout: options.timeout * 1000, killSignal: 'SIGKILL',
   });
+  let master = authenticate();
+  // SSH reports transport failures (including Broken pipe) with 255. Keep the
+  // real terminal attached; retry once without killing any shared connections.
+  // This can also retry authentication failures, which use the same exit code.
+  if (!master.error && !master.signal && master.status === 255) {
+    progress('SSH authentication/transport failed (exit 255). Retrying once with the same allocation; password/Okta may be requested again. Existing SSH masters are preserved.');
+    removeStaleSocket(fields.get('controlpath'), args, { execute, files, progress });
+    master = authenticate();
+  }
   if (master.error || master.status !== 0) {
     throw new QueryError('SSH_PREPARE_FAILED', 'Compute-node authentication did not complete. The allocation is retained; retry in the WSL Connect terminal.');
   }
