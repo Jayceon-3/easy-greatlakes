@@ -1,0 +1,8 @@
+{
+  "account": "eecs442f26_class",
+  "partition": "spgpu",
+  "gpus": 1,
+  "cpus": 4,
+  "memory": "24G",
+  "time": "03:00:00"
+}

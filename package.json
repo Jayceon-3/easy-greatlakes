@@ -1,0 +1,13 @@
+{
+  "name": "easy-greatlakes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Great Lakes remote development CLI prototype",
+  "bin": { "gl-dev": "bin/gl-dev.js" },
+  "scripts": {
+    "gl-dev": "node bin/gl-dev.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" }
+}

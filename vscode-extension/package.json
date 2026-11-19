@@ -1,0 +1,74 @@
+{
+  "name": "easy-greatlakes",
+  "displayName": "Great Lakes (Local Prototype)",
+  "description": "Prepare a Great Lakes allocation through WSL and open its project with Remote SSH.",
+  "publisher": "easy-greatlakes-local",
+  "version": "0.2.3",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "extensionDependencies": [
+    "ms-vscode-remote.remote-ssh"
+  ],
+  "main": "./extension.cjs",
+  "activationEvents": [
+    "onCommand:greatLakes.openProject",
+    "onCommand:greatLakes.connectProject",
+    "onCommand:greatLakes.cancelConnect"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "greatLakes.openProject",
+        "title": "Open gl-compute Project",
+        "category": "Great Lakes"
+      },
+      {
+        "command": "greatLakes.connectProject",
+        "title": "Connect and Open Project",
+        "category": "Great Lakes"
+      },
+      {
+        "command": "greatLakes.cancelConnect",
+        "title": "Stop Waiting for Connect",
+        "category": "Great Lakes"
+      }
+    ],
+    "configuration": {
+      "title": "Great Lakes",
+      "properties": {
+        "greatLakes.projectPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute Linux project directory on gl-compute. If empty, the command asks for a path and saves it in local User settings."
+        },
+        "greatLakes.wslDistribution": {
+          "type": "string",
+          "default": "Ubuntu-22.04",
+          "scope": "machine",
+          "description": "WSL distribution used by the existing gl-dev CLI and Windows SSH wrapper."
+        },
+        "greatLakes.wslUser": {
+          "type": "string",
+          "default": "jason",
+          "scope": "machine",
+          "description": "WSL user owning the existing SSH configuration and gl-dev job state."
+        },
+        "greatLakes.wslRepositoryPath": {
+          "type": "string",
+          "default": "/home/jason/easy-greatlakes",
+          "scope": "machine",
+          "description": "Absolute repository path in WSL. The extension executes bin/gl-dev.js from this checkout, using its gl-dev.config.json."
+        }
+      }
+    }
+  }
+}

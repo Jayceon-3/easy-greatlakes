@@ -1,0 +1,9 @@
+node_modules/
+*.tgz
+*.vsix
+.aws/
+.agents/
+.codex/
+.env
+.env.*
+!.env.example
