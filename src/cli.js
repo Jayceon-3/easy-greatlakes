@@ -4,6 +4,7 @@ import { stop } from './stop.js';
 import { connect, readConnectConfig } from './connect.js';
 import { parseArgs } from 'node:util';
 import { queryStatus, validateOptions } from './status.js';
+import { queryManagedStatus } from './managed-status.js';
 
 const HELP = `Great Lakes development tool (run in local WSL, Node.js >= 20)
 
@@ -12,11 +13,12 @@ Usage:
                  [--poll-interval 30] [--wait-timeout 1800] [--state-dir PATH]
   gl-dev stop [--job-id EXPECTED_ID] [--no-wait] [--json]
               [--poll-interval 15] [--wait-timeout 120] [--state-dir PATH]
-  gl-dev status <JobID> [--host gl-login] [--json] [--timeout 120]
-                       [--ssh-config /absolute/path/to/config]
+  gl-dev status [JobID] [--host gl-login] [--json] [--timeout 120]
+                       [--ssh-config /absolute/path/to/config] [--state-dir PATH]
 
 Examples:
   npm run gl-dev -- connect
+  node bin/gl-dev.js status
   npm run gl-dev -- status 66262642
   node bin/gl-dev.js status 66262642 --json
 
@@ -26,11 +28,12 @@ connect submits/reuses a managed job, waits for its node, and updates gl-compute
 --prepare-ssh authenticates the compute node in the current terminal before Remote SSH opens.
 The SSH update uses --ssh-config or ~/.ssh/config, with validation and a backup. VS Code is not opened yet.
 stop cancels only the saved managed job, after checking its ID, name, and remote owner.
-status only queries ordinary integer JobIDs. stop and status do not modify SSH settings.
+status without a JobID inspects the saved managed job; explicit JobIDs must be ordinary integers.
+stop and status do not modify SSH settings.
 Ctrl+C stops waiting and retains the job. Use gl-dev stop to release the managed allocation.
 Exit codes: 0 = command succeeded (check released/ready fields); 1 = operation failed; 2 = invalid arguments; 130 = interrupted.`;
 
-export function main(argv, { query = queryStatus, runConnect = connect, runStop = stop, updateSsh = updateComputeHost, prepareSsh = prepareComputeSsh, out = console.log, err = console.error } = {}) {
+export function main(argv, { query = queryStatus, managedQuery = queryManagedStatus, runConnect = connect, runStop = stop, updateSsh = updateComputeHost, prepareSsh = prepareComputeSsh, out = console.log, err = console.error } = {}) {
   let values, positionals;
   try {
     ({ values, positionals } = parseArgs({
@@ -84,8 +87,14 @@ export function main(argv, { query = queryStatus, runConnect = connect, runStop 
         noWait: values['no-wait'], stateDir: values['state-dir'], pollInterval, waitTimeout,
       }, values.json, { run: runConnect, updateSsh, prepareSsh, out, err });
     }
+    if (positionals[0] === 'status' && positionals.length === 1) {
+      validateOptions({ jobId: '1', host: values.host, timeout: Number(values.timeout) });
+      return finishManaged('status', {
+        host: values.host, timeout: Number(values.timeout), sshConfig: values['ssh-config'], stateDir: values['state-dir'],
+      }, values.json, { run: managedQuery, out, err });
+    }
     if (positionals.length !== 2 || positionals[0] !== 'status') {
-      throw new Error('Usage: gl-dev status <JobID>; use --help for details.');
+      throw new Error('Usage: gl-dev status [JobID]; use --help for details.');
     }
     // Validate before invoking even an injected query implementation.
     validateOptions({ jobId: positionals[1], host: values.host, timeout: Number(values.timeout) });
@@ -100,18 +109,21 @@ export function main(argv, { query = queryStatus, runConnect = connect, runStop 
     });
     if (values.json) {
       out(JSON.stringify(result, null, 2));
-    } else {
-      out(`Job ID: ${result.jobId}\nState: ${result.state}\nNode: ${result.node ?? '—'}`);
-      if (result.found) {
-        out(`Elapsed: ${result.elapsed}\nTime limit: ${result.timeLimit}\nTime left: ${result.timeLeft}\nReason: ${result.reason}`);
-      } else out(result.note);
-    }
+    } else printStatus(result, out);
     return 0;
   } catch (error) {
     if (values.json) err(JSON.stringify({ error: { code: error.code ?? 'UNKNOWN_ERROR', message: error.message } }));
     else err(`Query failed: ${error.message}`);
     return 1;
   }
+}
+
+function printStatus(result, out) {
+  out(`Job ID: ${result.jobId ?? '—'}\nState: ${result.state}\nNode: ${result.node ?? '—'}`);
+  if (result.jobName) out(`Managed job: ${result.jobName}`);
+  if (result.found) {
+    out(`Elapsed: ${result.elapsed}\nTime limit: ${result.timeLimit}\nTime left: ${result.timeLeft}\nReason: ${result.reason}`);
+  } else if (result.note) out(result.note);
 }
 
 async function finishManaged(action, options, json, { run, updateSsh, prepareSsh, out, err }) {
@@ -141,6 +153,7 @@ async function finishManaged(action, options, json, { run, updateSsh, prepareSsh
       }
     }
     if (json) out(JSON.stringify(result, null, 2));
+    else if (action === 'status') printStatus(result, out);
     else {
       out(`Job ID: ${result.jobId}\nState: ${result.state}\nNode: ${result.node ?? '—'}`);
       if (action === 'stop') out(result.released ? 'No managed allocation remains in the queue.' : 'Cancellation requested; release is not confirmed yet. Rerun stop to verify.');

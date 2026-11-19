@@ -108,7 +108,7 @@ test('CLI emits JSON suitable for later extension integration', () => {
 });
 
 test('CLI has distinct exits for usage and query failures; JSON errors go to stderr', () => {
-  for (const argv of [['connect', 'extra'], ['status'], ['status', 'x'], ['status', '1', '--unknown']]) {
+  for (const argv of [['connect', 'extra'], ['status', '1', 'extra'], ['status', 'x'], ['status', '1', '--unknown']]) {
     const result = invoke(argv, () => { throw new Error('must not query'); });
     assert.equal(result.code, 2);
     assert.deepEqual(result.stdout, []);
