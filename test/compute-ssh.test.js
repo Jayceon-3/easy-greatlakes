@@ -6,6 +6,70 @@ import { main } from '../src/cli.js';
 const options = { node: 'gl1502', timeout: 120 };
 const config = 'hostname gl1502\ncontrolmaster auto\ncontrolpath /home/jason/.ssh/cm-token\ncontrolpersist 1800\n';
 
+function socketFixture({ probe, replacement, socket = true, uid = process.getuid() } = {}) {
+  const path = '/home/jason/.ssh/cm-token';
+  const calls = [], removed = [], logs = [];
+  let stats = 0;
+  const stat = { dev: 1, ino: 10, uid, isSocket: () => socket };
+  const run = () => prepareComputeSsh(options, {
+    files: {
+      lstatSync: checked => { assert.equal(checked, path); return stats++ === 0 ? stat : { ...stat, ...replacement }; },
+      unlinkSync: checked => removed.push(checked),
+    },
+    execute: (_file, args, settings) => {
+      calls.push(args);
+      assert.ok(!args.includes('exit'));
+      if (args.includes('-G')) return { status: 0, stdout: config };
+      if (args.includes('-S')) {
+        assert.equal(args[args.indexOf('-S') + 1], path);
+        assert.equal(settings.env.LC_ALL, 'C');
+        return probe;
+      }
+      if (args.includes('-MNf') && probe.status === 255) assert.deepEqual(removed, [path]);
+      return { status: 0 };
+    },
+    remote: () => ({ body: 'gl1502.arc-ts.umich.edu' }),
+    progress: line => logs.push(line),
+  });
+  return { run, calls, removed, logs, path };
+}
+
+test('refused stale socket is removed before authenticating a replacement connection', () => {
+  const fixture = socketFixture({ probe: { status: 255, stderr: 'Control socket connect(/home/jason/.ssh/cm-token): Connection refused\n' } });
+  assert.equal(fixture.run().ready, true);
+  assert.deepEqual(fixture.removed, [fixture.path]);
+  assert.match(fixture.logs[0], /Removed stale SSH control socket/);
+});
+
+test('live SSH socket is preserved', () => {
+  const fixture = socketFixture({ probe: { status: 0, stderr: 'Master running (pid=123)' } });
+  assert.equal(fixture.run().ready, true);
+  assert.deepEqual(fixture.removed, []);
+});
+
+test('ambiguous probe failures never remove a socket or start authentication', () => {
+  for (const probe of [
+    { status: 255, stderr: 'Permission denied' },
+    { status: null, error: { code: 'ETIMEDOUT' } },
+    { status: null, signal: 'SIGTERM' },
+    { status: 1, stderr: 'Connection refused' },
+  ]) {
+    const fixture = socketFixture({ probe });
+    assert.throws(fixture.run, { code: 'SSH_MULTIPLEX_FAILED' });
+    assert.deepEqual(fixture.removed, []);
+    assert.ok(!fixture.calls.some(args => args.includes('-MNf')));
+  }
+});
+
+test('non-sockets, foreign sockets and replaced sockets are preserved', () => {
+  for (const settings of [{ socket: false }, { uid: process.getuid() + 1 }, { replacement: { ino: 11 } }]) {
+    const fixture = socketFixture({ ...settings, probe: { status: 255, stderr: 'Control socket connect(/home/jason/.ssh/cm-token): Connection refused' } });
+    assert.throws(fixture.run, { code: 'SSH_MULTIPLEX_FAILED' });
+    assert.deepEqual(fixture.removed, []);
+    assert.ok(!fixture.calls.some(args => args.includes('-MNf')));
+  }
+});
+
 test('authentication uses the real terminal and preserves host-key confirmation', () => {
   const calls = [];
   const result = prepareComputeSsh(options, {
@@ -56,6 +120,27 @@ test('connection to an unexpected node is rejected and existing connections are 
     execute: (_file, args) => { assert.ok(!args.includes('exit')); return { status: 0, stdout: config }; },
     remote: () => ({ body: 'gl9999' }),
   }), { code: 'SSH_NODE_MISMATCH' });
+});
+
+test('full Great Lakes hostname is accepted for the allocated node', () => {
+  const result = prepareComputeSsh(options, {
+    execute: () => ({ status: 0, stdout: config }),
+    remote: () => ({ body: 'gl1502.arc-ts.umich.edu' }),
+  });
+  assert.deepEqual(result, { ready: true, host: 'gl-compute', node: 'gl1502' });
+});
+
+test('other nodes, domains and malformed hostname output remain rejected', () => {
+  for (const hostname of ['gl9999.arc-ts.umich.edu', 'gl1502.example.com', 'gl1502.arc-ts.umich.edu.example.com', '', 'gl1502\ngl1502.arc-ts.umich.edu']) {
+    assert.throws(() => prepareComputeSsh(options, {
+      execute: () => ({ status: 0, stdout: config }),
+      remote: () => ({ body: hostname }),
+    }), error => {
+      assert.equal(error.code, 'SSH_NODE_MISMATCH');
+      assert.ok(error.message.includes(JSON.stringify(hostname)));
+      return true;
+    });
+  }
 });
 
 test('alternate SSH configuration is passed to both inspection and authentication', () => {
