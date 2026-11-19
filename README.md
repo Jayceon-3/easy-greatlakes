@@ -4,8 +4,9 @@ A VS Code extension project that automates the Great Lakes development connectio
 
 ## VS Code extension
 
-Install `vscode-extension/easy-greatlakes-0.2.3.vsix` locally in Windows VS Code via **Extensions → … → Install from VSIX…**. It can be used from a WSL workspace window, while its UI-side code runs locally.
+Install `vscode-extension/easy-greatlakes-0.2.4.vsix` locally in Windows VS Code via **Extensions → … → Install from VSIX…**. It can be used from a WSL workspace window, while its UI-side code runs locally.
 
+- **Great Lakes: Release Resources** queries the managed job, confirms its JobID/node, then runs `stop --job-id` in WSL and reports release status.
 - **Great Lakes: Stop Waiting for Connect** clears a stuck local wait without cancelling jobs.
 - **Great Lakes: Open gl-compute Project** only opens the configured host and remote directory.
 - **Great Lakes: Connect and Open Project** runs this checkout's WSL CLI in an interactive terminal, waits for a ready allocation and successful gl-compute update, then opens the project in a new Remote SSH window.
@@ -20,6 +21,7 @@ Run from a **local WSL terminal** in this repository. Requires Node.js 20 or new
 
 ```bash
 node bin/gl-dev.js --help
+node bin/gl-dev.js status            # Inspect the saved managed job
 node bin/gl-dev.js status YOUR_JOB_ID
 ```
 
@@ -52,6 +54,17 @@ node bin/gl-dev.js status YOUR_JOB_ID --host gl-login --ssh-config /home/jason/.
 ```
 
 The status command uses local SSH settings by default, without hardcoding the account, node, or project path. It queries only the current user's queue on the current cluster. Historical, array, and heterogeneous jobs are not supported yet.
+
+Omit the JobID to inspect the allocation recorded by `connect` (including one created through the VS Code extension):
+
+```bash
+node bin/gl-dev.js status
+node bin/gl-dev.js status --json
+```
+
+The result includes JobID, managed job name, state, node, elapsed time, time limit, time left, and queue reason. It verifies both the saved JobID (when available) and managed job name against one queue snapshot. It does not select unrelated or manually submitted jobs. If Connect used a different `--host`, `--ssh-config`, or `--state-dir`, supply the same options for managed status.
+
+`NO_MANAGED_JOB` means there is no saved allocation; it does not mean the user's entire queue is empty. `NOT_IN_QUEUE` means the saved job is absent, without inferring whether it completed, expired, or was cancelled. `SUBMISSION_UNKNOWN` means a previous submission is unresolved. All three include an explanatory note. Failed queries produce errors rather than an ended status. Managed status preserves the saved job record and SSH settings, and never submits or cancels jobs. It shares the connect/stop state lock, so an operation already in progress can temporarily block it.
 
 ## Status and errors
 

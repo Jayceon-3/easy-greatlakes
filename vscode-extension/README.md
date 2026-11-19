@@ -1,14 +1,15 @@
 # Great Lakes (Local Prototype)
 
-Version 0.2.3 provides three commands:
+Version 0.2.4 provides four commands:
 
 - **Great Lakes: Open gl-compute Project**: open the existing host and saved directory without invoking the CLI or changing SSH settings.
+- **Great Lakes: Release Resources** queries the managed job, confirms its JobID/node, then runs `stop --job-id` in WSL and reports release status.
 - **Great Lakes: Stop Waiting for Connect**: clear the local pending operation without stopping the CLI terminal or cancelling any Slurm job.
 - **Great Lakes: Connect and Open Project**: run the existing WSL CLI, prepare or reuse an allocation, update gl-compute, then open the project in a new Remote SSH window.
 
 ## Installation and settings
 
-Install `easy-greatlakes-0.2.3.vsix` locally in Windows VS Code using **Extensions → … → Install from VSIX…**. Install/enable Remote - SSH locally as well. Commands can be invoked from a WSL workspace window: the extension itself runs on the local UI side.
+Install `easy-greatlakes-0.2.4.vsix` locally in Windows VS Code using **Extensions → … → Install from VSIX…**. Install/enable Remote - SSH locally as well. Commands can be invoked from a WSL workspace window: the extension itself runs on the local UI side.
 
 Keep the working `remote.SSH.path` and `remote.SSH.configFile` settings and Windows → WSL wrapper. The extension does not generate or change those settings. In the Windows file picker, this repository is available at `\\wsl.localhost\Ubuntu-22.04\home\jason\easy-greatlakes`.
 
@@ -34,6 +35,8 @@ Use your actual remote project directory; if projectPath is empty, either comman
 
 Before compute authentication, the CLI checks any existing `gl-compute` control socket. It removes that specific socket only when it belongs to the current WSL user and `ssh -O check` explicitly reports connection refused, then establishes the connection again. Live sockets are preserved. Timeouts, permission errors, non-socket files, symlinks, or a changed socket stop recovery without deletion. This CLI update takes effect on the next Connect without reinstalling the VSIX. It does not cancel jobs or terminate existing SSH masters.
 
+If compute authentication exits with SSH status 255 (which includes transport failures such as Broken pipe as well as authentication failures), the CLI checks for a stale socket again and retries authentication once with the same allocation. Prompts remain interactive, and password/Okta may be requested again. Timeouts and process interruption are not retried. A second failure preserves the allocation and reports the error; recovery never runs `ssh -O exit` against an active master. This is a bounded retry, not a diagnosis or guaranteed fix for the underlying network failure.
+
 Existing manually submitted jobs are not adopted. This command can allocate new resources and change gl-compute's target via the CLI. It never runs stop, scancel, connection cleanup, or window closing. Existing sessions are left open. Use the original Open command when you only want another window on the existing host.
 
 If the CLI returns a pending job after its wait limit, no remote window opens. Run Connect again to resume. Failures do not automatically submit a replacement or release resources. To interrupt queue waiting, press Ctrl+C in the new Connect terminal; the CLI keeps the allocation. If a terminal is forcibly closed, inspect its saved job state before retrying. Crash-created PID locks are automatically recovered by the current CLI only after confirming the owner has exited. Saved job state is preserved.
@@ -53,7 +56,7 @@ Run `npm test` from the repository root. Tests use mocked VS Code APIs, simulate
 From this directory:
 
 ```bash
-npx @vscode/vsce package --allow-missing-repository --skip-license
+npx @vscode/vsce package --no-dependencies --allow-missing-repository --skip-license
 ```
 
 This builds a local VSIX; it does not publish or install it. No runtime npm dependencies are needed by the extension.
@@ -87,3 +90,13 @@ After allocation and SSH configuration updates, the CLI now completes compute-no
 This targets the case where the Remote SSH installation terminal displays a yes/no host-key prompt but keyboard input is not forwarded correctly through the WSL wrapper. The exact Remote SSH input failure has not been independently reproduced; moving authentication to the actual WSL terminal avoids depending on that input path. Existing host verification stays enabled, and existing sessions are not closed.
 
 For an immediate workaround with a valid existing allocation, run `ssh -MNf gl-compute` in a normal local WSL terminal, finish fingerprint verification and authentication there, and use Open gl-compute Project. This does not submit a new job. The new Connect command reuses its existing managed allocation if still valid.
+
+## Release Resources in 0.2.4
+
+Install the new VSIX locally in Windows VS Code and reload the initiating window when ready. Run **Great Lakes: Release Resources** from the command palette. A Great Lakes Status terminal runs `status --json` using the same WSL identity and repository as Connect. No project path is required. With a confirmed managed job, a modal shows its JobID, node, state, and the effect of cancellation. Dismissing the modal sends no cancellation. Query errors stop the operation.
+
+After confirmation, a Great Lakes Release terminal runs `stop --json --job-id CONFIRMED_ID`. The CLI rechecks job identity/name/owner under the existing connect/stop lock; a changed JobID is rejected. The result reports either confirmed release or cancellation still pending. Pending jobs can also be released. Authentication remains interactive, and a timeout/interruption after cancellation does not imply the job was retained: query its status before retrying. There is no automatic cancellation retry.
+
+Connect and Release cannot run concurrently in the same extension instance. CLI locks protect state operations across windows, and the confirmed JobID protects against a changed allocation during the confirmation dialog. Release cancels processes in the target allocation and may disconnect its remote sessions. It does not terminate SSH masters or close VS Code windows. **Stop Waiting for Connect** continues to affect only Connect monitoring.
+
+The CLI now also accepts `node bin/gl-dev.js status --json` without a JobID to inspect the saved managed allocation. Explicit `status JOB_ID` remains supported. Tests cover confirmed/cancelled release, missing and pending jobs, query errors, mismatched results, frozen WSL settings, and strict bridge JSON validation. Real cancellation via this new UI remains a user-side integration check.
