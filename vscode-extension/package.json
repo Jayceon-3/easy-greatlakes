@@ -3,7 +3,7 @@
   "displayName": "Great Lakes (Local Prototype)",
   "description": "Prepare a Great Lakes allocation through WSL and open its project with Remote SSH.",
   "publisher": "easy-greatlakes-local",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "license": "UNLICENSED",
   "engines": {
     "vscode": "^1.85.0"
@@ -21,7 +21,8 @@
   "activationEvents": [
     "onCommand:greatLakes.openProject",
     "onCommand:greatLakes.connectProject",
-    "onCommand:greatLakes.cancelConnect"
+    "onCommand:greatLakes.cancelConnect",
+    "onCommand:greatLakes.releaseResources"
   ],
   "contributes": {
     "commands": [
@@ -38,6 +39,11 @@
       {
         "command": "greatLakes.cancelConnect",
         "title": "Stop Waiting for Connect",
+        "category": "Great Lakes"
+      },
+      {
+        "command": "greatLakes.releaseResources",
+        "title": "Release Resources",
         "category": "Great Lakes"
       }
     ],

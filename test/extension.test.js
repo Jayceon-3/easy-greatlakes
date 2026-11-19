@@ -31,7 +31,9 @@ test('extension manifest contributes local UI commands and declares Remote SSH d
   const manifest = JSON.parse(readFileSync('vscode-extension/package.json', 'utf8'));
   assert.deepEqual(manifest.extensionKind, ['ui']);
   assert.deepEqual(manifest.extensionDependencies, ['ms-vscode-remote.remote-ssh']);
-  assert.equal(manifest.contributes.commands.length, 3);
+  assert.equal(manifest.contributes.commands.length, 4);
+  assert.ok(manifest.contributes.commands.some(command => command.command === 'greatLakes.releaseResources'));
+  assert.ok(manifest.activationEvents.includes('onCommand:greatLakes.releaseResources'));
   assert.equal(manifest.contributes.commands[0].command, 'greatLakes.openProject');
   assert.equal(manifest.contributes.configuration.properties['greatLakes.projectPath'].default, '');
   assert.equal(typeof require('../vscode-extension/extension.cjs').activate, 'function');

@@ -5,7 +5,12 @@ const { validateProjectPath } = require('./open-project.cjs');
 
 function quote(value) { return "'" + String(value).replaceAll("'", "'\"'\"'") + "'"; }
 
-function buildRequest(settings, id = randomUUID()) {
+function buildRequest(settings, id = randomUUID(), { action = 'connect', expectedJobId } = {}) {
+  if (!['connect', 'status', 'stop'].includes(action)) throw new Error('Invalid CLI action.');
+  if (action === 'stop' && !/^[1-9]\d*$/.test(expectedJobId ?? '')) throw new Error('Release requires an explicit JobID.');
+  const label = action === 'connect' ? 'Connect' : action === 'stop' ? 'Release' : 'Status';
+  const command = action === 'connect' ? 'connect --json --prepare-ssh'
+    : action === 'stop' ? `stop --json --job-id ${quote(expectedJobId)}` : 'status --json';
   const distribution = settings.get('wslDistribution', 'Ubuntu-22.04');
   const user = settings.get('wslUser', 'jason');
   const repository = settings.get('wslRepositoryPath', '/home/jason/easy-greatlakes');
@@ -29,7 +34,7 @@ function buildRequest(settings, id = randomUUID()) {
     `  printf '%s' "$gl_status" > ${quote(`${directory}/exit.tmp`)}`,
     `  mv -- ${quote(`${directory}/exit.tmp`)} ${quote(`${directory}/exit`)}`,
     '  if [ "$gl_status" -ne 0 ]; then',
-    '    printf "\\nGreat Lakes Connect failed (exit %s). Review the terminal output above.\\n" "$gl_status" >&2',
+    `    printf "\\nGreat Lakes ${label} failed (exit %s). Review the terminal output above.\\n" "$gl_status" >&2`,
     '    if [ -t 0 ]; then read -r -p "Press Enter to close this terminal... " gl_unused || :; fi',
     '  fi',
     '}',
@@ -37,13 +42,13 @@ function buildRequest(settings, id = randomUUID()) {
     "trap 'exit 130' INT",
     "trap 'exit 143' TERM",
     // The conditional also works when interactive startup enables errexit.
-    `if (cd ${quote(repository)} && node bin/gl-dev.js connect --json --prepare-ssh) > ${quote(`${directory}/result.tmp`)}; then`,
+    `if (cd ${quote(repository)} && node bin/gl-dev.js ${command}) > ${quote(`${directory}/result.tmp`)}; then`,
     '  exit 0',
     'else',
     '  exit "$?"',
     'fi',
   ].join('\n');
-  return { directory: windowsDirectory, scriptPath: `${directory}/run.sh`, distribution, user, repository, script };
+  return { action, expectedJobId, label, directory: windowsDirectory, scriptPath: `${directory}/run.sh`, distribution, user, repository, script };
 }
 
 async function prepareRequest(request, files = fs) {
@@ -53,11 +58,15 @@ async function prepareRequest(request, files = fs) {
 }
 
 async function runWslConnect(vscode, settings, output, {
-  platform = process.platform, files = fs, request = buildRequest(settings), pollMs = 750, signal, ioTimeoutMs = 10000, maxWaitMs = 40 * 60 * 1000, prepare = prepareRequest,
+  action = 'connect', expectedJobId, platform = process.platform, files = fs, request = buildRequest(settings, undefined, { action, expectedJobId }), pollMs = 750, signal, ioTimeoutMs = 10000, maxWaitMs = 40 * 60 * 1000, prepare = prepareRequest,
 } = {}) {
-  if (signal?.aborted) throw new Error('Connect monitoring cancelled.');
-  if (platform !== 'win32') throw new Error('Connect must run in the Windows local extension host. Install this extension locally, not in WSL.');
-  output.appendLine(`Running WSL connect: ${request.distribution}, user ${request.user}, repository ${request.repository}`);
+  const label = request.label ?? 'Connect';
+  const interruptionNote = request.action === 'stop'
+    ? 'Cancellation may already have been sent; check job status before retrying.'
+    : 'No cancellation was sent. Any submitted job is retained.';
+  if (signal?.aborted) throw new Error(`${label} monitoring cancelled.`);
+  if (platform !== 'win32') throw new Error(`${label} must run in the Windows local extension host. Install this extension locally, not in WSL.`);
+  output.appendLine(`Running WSL ${label.toLowerCase()}: ${request.distribution}, user ${request.user}, repository ${request.repository}`);
   try {
     await prepare(request, files);
   } catch (error) {
@@ -68,7 +77,7 @@ async function runWslConnect(vscode, settings, output, {
   // An actual VS Code terminal gives SSH a controlling TTY for password/Okta prompts.
   // stdout carries only JSON to a private per-request file; stderr stays visible.
   const terminal = vscode.window.createTerminal({
-    name: 'Great Lakes Connect', shellPath: 'wsl.exe',
+    name: `Great Lakes ${label}`, shellPath: 'wsl.exe',
     shellArgs: ['--distribution', request.distribution, '--user', request.user, '--exec', 'bash', '-i', request.scriptPath],
     isTransient: true,
   });
@@ -78,13 +87,13 @@ async function runWslConnect(vscode, settings, output, {
     let timer;
     let subscription;
     const started = Date.now();
-    const aborted = () => finish(new Error('Connect monitoring cancelled. The CLI may still be running; check its terminal. No job was cancelled.'));
+    const aborted = () => finish(new Error(`${label} monitoring cancelled. The CLI may still be running; check its terminal. ${interruptionNote}`));
     async function boundedRead(path) {
       let timeout;
       try {
         return await Promise.race([
           files.readFile(path, 'utf8'),
-          new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('WSL result file access timed out. Check the Connect terminal and WSL file share.')), ioTimeoutMs); }),
+          new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`WSL result file access timed out. Check the ${label} terminal and WSL file share.`)), ioTimeoutMs); }),
         ]);
       } finally { clearTimeout(timeout); }
     }
@@ -98,23 +107,19 @@ async function runWslConnect(vscode, settings, output, {
     }
     async function poll() {
       if (settled || busy) return;
-      if (Date.now() - started >= maxWaitMs) { finish(new Error('Connect monitoring timed out. Inspect the CLI terminal and job state before retrying.')); return; }
+      if (Date.now() - started >= maxWaitMs) { finish(new Error(`${label} monitoring timed out. Inspect the CLI terminal and job state before retrying.`)); return; }
       busy = true;
       try {
         const rawExit = await boundedRead(win32.join(request.directory, 'exit'));
         const exit = rawExit.trim();
         if (settled) return;
-        if (!/^\d+$/.test(exit)) throw new Error(`Invalid CLI exit status ${JSON.stringify(rawExit)}. Inspect ${request.directory} and the retained Great Lakes Connect terminal.`);
-        if (Number(exit) === 130 || Number(exit) === 143) throw new Error('Connect was interrupted. No remote window was opened. Any submitted job is retained; run Connect again to resume.');
-        if (Number(exit) !== 0) throw new Error(`WSL connect exited with code ${exit}. Check the Great Lakes Connect terminal. Any submitted job is retained; retry after resolving the error.`);
+        if (!/^\d+$/.test(exit)) throw new Error(`Invalid CLI exit status ${JSON.stringify(rawExit)}. Inspect ${request.directory} and the retained Great Lakes ${label} terminal.`);
+        if (Number(exit) === 130 || Number(exit) === 143) throw new Error(`${label} was interrupted. ${interruptionNote} No remote window was opened.`);
+        if (Number(exit) !== 0) throw new Error(`WSL ${label.toLowerCase()} exited with code ${exit}. Check the Great Lakes ${label} terminal and job status before retrying.`);
         const text = await boundedRead(win32.join(request.directory, 'result.json'));
         if (settled) return;
         const result = JSON.parse(text);
-        if (typeof result.ready !== 'boolean' || !/^[1-9]\d*$/.test(result.jobId) || typeof result.state !== 'string') throw new Error('Invalid CLI connect result.');
-        if (result.host !== 'gl-login') throw new Error('Unexpected CLI login host.');
-        if (result.ready && (!result.sshConfigUpdate || result.sshConfigUpdate.node !== result.node || !/^gl\d+$/.test(result.node) || !result.computeSsh?.ready || result.computeSsh.node !== result.node || !/^[1-9]\d*$/.test(result.jobId))) {
-          throw new Error('CLI did not confirm a valid allocation, SSH update and reusable authenticated compute connection. No remote window was opened.');
-        }
+        validateResult(result, request.action ?? 'connect', request.expectedJobId);
         try { await files.rm(request.directory, { recursive: true, force: true }); }
         catch (error) { output.appendLine(`Could not remove temporary result files: ${error.message}`); }
         finish(null, result);
@@ -134,6 +139,21 @@ async function runWslConnect(vscode, settings, output, {
     timer = setInterval(poll, pollMs);
     poll();
   });
+}
+
+function validateResult(result, action, expectedJobId) {
+  if (!result || result.host !== 'gl-login' || typeof result.state !== 'string') throw new Error('Invalid CLI result or unexpected login host.');
+  const validId = /^[1-9]\d*$/.test(result.jobId ?? '');
+  if (action === 'status') {
+    if (typeof result.found !== 'boolean' || (result.found ? !validId || !/^gldev-[a-f0-9]{24}$/.test(result.jobName ?? '') : result.jobId !== null && !validId)) throw new Error('Invalid CLI managed status result.');
+  } else if (action === 'stop') {
+    if (result.jobId !== expectedJobId || typeof result.released !== 'boolean' || (result.released ? result.state !== 'NOT_IN_QUEUE' : result.cancellationRequested !== true)) throw new Error('Invalid CLI release result or mismatched JobID.');
+  } else {
+    if (typeof result.ready !== 'boolean' || !validId) throw new Error('Invalid CLI connect result.');
+    if (result.ready && (!result.sshConfigUpdate || result.sshConfigUpdate.node !== result.node || !/^gl\d+$/.test(result.node) || !result.computeSsh?.ready || result.computeSsh.node !== result.node)) {
+      throw new Error('CLI did not confirm a valid allocation, SSH update and reusable authenticated compute connection. No remote window will be opened.');
+    }
+  }
 }
 
 function waitForOperation(task, signal) {
