@@ -16,9 +16,12 @@ async function fixture(t, phase = 'active') {
   const state = () => JSON.parse(readFileSync(path(), 'utf8'));
   const row = (status = 'RUNNING') => `12345|${status}|gl1504|${state().name}|None`;
   if (phase === 'submitting') {
-    await assert.rejects(connect(options, { remote: () => { throw new Error('lost response'); } }));
+    await assert.rejects(connect(options, { remote: (_o, cmd) => {
+      if (cmd === 'true') return { body: '' };
+      throw new Error('lost response');
+    } }));
   } else if (phase !== 'none') {
-    await connect(options, { remote: (_o, cmd) => ({ body: cmd.includes('sbatch') ? '12345' : row() }) });
+    await connect(options, { remote: (_o, cmd) => ({ body: cmd === 'true' ? '' : cmd.includes('sbatch') ? '12345' : row() }) });
   }
   return { options, state, row, path, write: value => writeFileSync(path(), JSON.stringify(value)),
     hasState: () => readdirSync(stateDir).some(name => name.endsWith('.json')) };

@@ -38,9 +38,10 @@ export async function stop(options, {
       return parseManagedQueue(body, state.name, state.jobId);
     };
     let job = query();
+    if (state.phase === 'rejected' && job) throw new QueryError('IDENTITY_MISMATCH', 'A rejected request unexpectedly matches a queued job. No cancellation was sent.');
     if (!job) {
       if (state.phase === 'submitting') throw new QueryError('SUBMISSION_UNKNOWN', `Submission is unresolved. Inspect squeue/sacct for ${state.name}; saved state was retained.`);
-      if (state.phase !== 'stopping' && now() - state.createdAt < 60000) {
+      if (!['stopping', 'rejected'].includes(state.phase) && now() - state.createdAt < 60000) {
         throw new QueryError('JOB_NOT_VISIBLE', 'The recent job is not visible yet. Retry shortly; saved state was retained.');
       }
       clearState(statePath);

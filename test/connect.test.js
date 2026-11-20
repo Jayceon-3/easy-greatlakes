@@ -23,6 +23,7 @@ function fixture(t) {
   return { options, state, writeState };
 }
 function queue(state, status = 'RUNNING') {
+  if (!state) return { body: '' }; // Login preflight has no saved request yet.
   return { body: `12345|${status}|${status === 'RUNNING' ? 'gl1504' : ''}|${state.name}|Resources` };
 }
 
@@ -65,7 +66,10 @@ test('pending jobs return with no-wait and can later resume without another subm
 
 test('uncertain submission is recovered by unique job name', async t => {
   const { options, state } = fixture(t);
-  await assert.rejects(connect(options, { remote: () => { throw new Error('connection lost'); } }), { code: 'SUBMISSION_UNKNOWN' });
+  await assert.rejects(connect(options, { remote: (_o, command) => {
+    if (command === 'true') return { body: '' };
+    throw new Error('connection lost');
+  } }), { code: 'SUBMISSION_UNKNOWN' });
   assert.equal(state().phase, 'submitting');
   const result = await connect(options, { remote: (_o, cmd) => { assert.doesNotMatch(cmd, /sbatch/); return queue(state()); } });
   assert.equal(result.jobId, '12345');
@@ -73,8 +77,9 @@ test('uncertain submission is recovered by unique job name', async t => {
 });
 
 test('uncertain submission with no matching job never resubmits', async t => {
-  const { options } = fixture(t);
+  const { options, state, writeState } = fixture(t);
   await assert.rejects(connect(options, { remote: () => ({ body: 'malformed' }) }), { code: 'SUBMISSION_UNKNOWN' });
+  writeState({ ...state(), remoteSubmissionVersion: undefined }); // Legacy request without remote receipts.
   await assert.rejects(connect(options, { remote: (_o, cmd) => { assert.doesNotMatch(cmd, /sbatch/); return { body: '' }; } }), { code: 'SUBMISSION_UNKNOWN' });
 });
 
@@ -102,7 +107,7 @@ test('expired known allocation can be replaced; unrelated jobs are ignored', asy
     return queue(state());
   } });
   assert.equal(result.ready, true);
-  assert.equal(calls, 3);
+  assert.equal(calls, 4);
 });
 
 test('newly submitted invisible jobs are not immediately replaced', async t => {
@@ -173,7 +178,9 @@ test('CLI connect supports JSON and sends progress to stderr', async () => {
   });
   assert.equal(code, 0);
   assert.equal(JSON.parse(stdout[0]).jobId, '12345');
-  assert.deepEqual(stderr, ['Waiting']);
+  assert.match(stderr[0], /Requested resources:/);
+  assert.match(stderr[0], /GPUs: 1/);
+  assert.deepEqual(stderr.slice(1), ['Waiting']);
 });
 
 test('corrupt persisted state fails before any SSH or submission', async t => {
@@ -214,4 +221,167 @@ test('invalid configuration and polling options fail before connect execution', 
   });
   assert.equal(result, 2);
   assert.equal(called, false);
+});
+
+test('VPN/login failure before submission creates no intent and the next connect can submit', async t => {
+  const { options, state } = fixture(t);
+  for (const code of ['SSH_FAILED', 'TIMEOUT', 'INTERRUPTED']) {
+    await assert.rejects(connect(options, { remote: (_o, command) => {
+      assert.equal(command, 'true');
+      assert.equal(state(), null);
+      throw Object.assign(new Error('Login unavailable'), { code });
+    } }), { code });
+    assert.equal(state(), null);
+  }
+  let submits = 0;
+  await connect(options, { remote: (_o, command) => {
+    if (command === 'true') return { body: '' };
+    if (command.includes('sbatch')) { submits++; return { body: '12345' }; }
+    return queue(state());
+  } });
+  assert.equal(submits, 1);
+});
+
+test('aborting after preflight does not leave a submission intent', async t => {
+  const { options, state } = fixture(t);
+  const controller = new AbortController();
+  await assert.rejects(connect({ ...options, signal: controller.signal }, {
+    remote: (_o, command) => {
+      assert.equal(command, 'true');
+      controller.abort();
+      return { body: '' };
+    },
+  }), { code: 'INTERRUPTED' });
+  assert.equal(state(), null);
+});
+
+test('confirmed unsubmitted request is backed up and retried after a successful empty queue query', async t => {
+  const { options, state, writeState } = fixture(t);
+  await assert.rejects(connect(options, { remote: (_o, cmd) => {
+    if (cmd === 'true') return { body: '' };
+    throw new Error('lost response');
+  } }), { code: 'SUBMISSION_UNKNOWN' });
+  writeState({ ...state(), remoteSubmissionVersion: undefined });
+  const original = state();
+  let submitted = false;
+  await connect({ ...options, retryUnsubmitted: original.name }, { remote: (_o, cmd) => {
+    assert.ok(!cmd.includes('scancel'));
+    if (cmd === 'true') return { body: '' };
+    if (cmd.includes('sbatch')) {
+      submitted = true;
+      assert.notEqual(state().name, original.name);
+      return { body: '12345' };
+    }
+    return submitted ? queue(state()) : { body: '999|RUNNING|gl9999|manual-important|None' };
+  } });
+  const backup = readdirSync(options.stateDir).find(file => file.endsWith('.bak'));
+  assert.deepEqual(JSON.parse(readFileSync(join(options.stateDir, backup), 'utf8')), original);
+  assert.equal(state().phase, 'active');
+});
+
+test('confirmed retry cannot bypass query errors or a different saved request', async t => {
+  const { options, state } = fixture(t);
+  await assert.rejects(connect(options, { remote: (_o, cmd) => {
+    if (cmd === 'true') return { body: '' };
+    throw new Error('lost response');
+  } }));
+  const original = state();
+  await assert.rejects(connect({ ...options, retryUnsubmitted: `gldev-${'0'.repeat(24)}` }, {
+    remote: () => assert.fail('wrong request must not reach SSH'),
+  }), { code: 'IDENTITY_MISMATCH' });
+  await assert.rejects(connect({ ...options, retryUnsubmitted: original.name }, {
+    remote: (_o, cmd) => { assert.ok(cmd.includes('squeue')); throw new Error('VPN unavailable'); },
+  }), /VPN unavailable/);
+  assert.deepEqual(state(), original);
+  assert.ok(!readdirSync(options.stateDir).some(file => file.endsWith('.bak')));
+  // If the supposedly unsubmitted request exists, reuse it instead of resubmitting.
+  const result = await connect({ ...options, retryUnsubmitted: original.name }, {
+    remote: (_o, cmd) => { assert.ok(cmd.includes('squeue')); return queue(state()); },
+  });
+  assert.equal(result.jobId, '12345');
+  assert.equal(state().name, original.name);
+});
+
+test('CLI forwards exact confirmed request names and rejects invalid recovery flags', async () => {
+  const request = `gldev-${'a'.repeat(24)}`;
+  assert.equal(await main(['connect', '--retry-unsubmitted', request], {
+    runConnect: async options => {
+      assert.equal(options.retryUnsubmitted, request);
+      return { jobId: '12345', state: 'PENDING', ready: false };
+    }, out: () => {}, err: () => {},
+  }), 0);
+  for (const argv of [['connect', '--retry-unsubmitted', 'bad'], ['stop', '--retry-unsubmitted', request], ['status', '--retry-unsubmitted', request]]) {
+    assert.equal(await main(argv, {
+      runConnect: () => assert.fail('invalid recovery must not connect'),
+      runStop: () => assert.fail('invalid recovery must not stop'),
+      managedQuery: () => assert.fail('invalid recovery must not query'),
+      err: () => {},
+    }), 2);
+  }
+});
+
+test('reuse-managed uses custom CLI allocation resources even when defaults differ', async t => {
+  for (const status of ['RUNNING', 'PENDING']) {
+    const { options, state } = fixture(t);
+    const custom = { ...config, gpus: 2, cpus: 8, memory: '48G', time: '01:00:00' };
+    await connect({ ...options, config: custom }, {
+      remote: (_o, cmd) => cmd === 'true' ? { body: '' } : cmd.includes('sbatch') ? { body: '12345' } : queue(state(), status),
+    });
+    const original = state();
+    const logs = [];
+    const result = await connect({ ...options, reuseManaged: true }, {
+      remote: (_o, cmd) => { assert.ok(cmd.includes('squeue')); return queue(state(), status); },
+      progress: line => logs.push(line),
+    });
+    assert.equal(result.jobId, '12345');
+    assert.equal(result.ready, status === 'RUNNING');
+    assert.deepEqual(state(), original);
+    assert.ok(logs.some(line => line.includes('2 GPU') && line.includes('01:00:00')));
+  }
+});
+
+test('reuse-managed submits defaults when no job exists or the saved job ended', async t => {
+  const { options, state, writeState } = fixture(t);
+  let submitting = false;
+  const remote = (_o, cmd) => {
+    if (cmd === 'true') return { body: '' };
+    if (cmd.includes('sbatch')) {
+      submitting = true;
+      assert.equal(state().config.gpus, 1);
+      assert.equal(state().config.time, '03:00:00');
+      return { body: '12345' };
+    }
+    return submitting ? queue(state()) : { body: '' };
+  };
+  await connect({ ...options, reuseManaged: true }, { remote });
+  const originalName = state().name;
+  writeState({ ...state(), config: { ...config, gpus: 2 }, createdAt: 0 });
+  submitting = false;
+  await connect({ ...options, reuseManaged: true }, { remote });
+  assert.notEqual(state().name, originalName);
+  assert.deepEqual(state().config, config);
+});
+
+test('reuse-managed never falls back on failed queries or invalid saved resources', async t => {
+  const { options, state, writeState } = fixture(t);
+  await connect(options, { remote: (_o, cmd) => cmd === 'true' ? { body: '' } : cmd.includes('sbatch') ? { body: '12345' } : queue(state()) });
+  await assert.rejects(connect({ ...options, reuseManaged: true }, {
+    remote: (_o, cmd) => { assert.ok(cmd.includes('squeue')); throw new Error('SSH failed'); },
+  }), /SSH failed/);
+  writeState({ ...state(), config: { account: 'example' } });
+  await assert.rejects(connect({ ...options, reuseManaged: true }, {
+    remote: (_o, cmd) => { assert.ok(cmd.includes('squeue')); return queue(state()); },
+  }), { code: 'INVALID_SAVED_CONFIG' });
+});
+
+test('CLI reuse-managed forwards preference and rejects conflicting flags', async () => {
+  assert.equal(await main(['connect', '--reuse-managed'], {
+    runConnect: async options => {
+      assert.equal(options.reuseManaged, true);
+      return { jobId: '12345', state: 'PENDING', ready: false };
+    }, out: () => {}, err: () => {},
+  }), 0);
+  for (const argv of [['status', '--reuse-managed'], ['connect', '--reuse-managed', '--dry-run'], ['connect', '--reuse-managed', '--gpus', '2']]) {
+    assert.equal(await main(argv, { runConnect: () => assert.fail('must not connect'), err: () => {} }), 2);
+  }
 });

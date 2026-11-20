@@ -4,25 +4,32 @@ import { saveState, loadState, withStateLock } from './state.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runRemote, shellQuote, QueryError } from './ssh.js';
 import { validateOptions } from './status.js';
+import { buildRecordedSubmission } from './remote-submission.js';
 
 export const DEFAULT_RESOURCES = Object.freeze({
   partition: 'spgpu', gpus: 1, cpus: 4, memory: '24G', time: '03:00:00',
 });
 
-export function readConnectConfig(path) {
-  const supplied = JSON.parse(readFileSync(path, 'utf8'));
-  const config = { ...DEFAULT_RESOURCES, ...supplied };
+export function resolveConnectConfig(supplied = {}, overrides = {}) {
+  for (const value of [supplied, overrides]) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Resource configuration must be a JSON object.');
+  }
+  const config = { ...DEFAULT_RESOURCES, ...supplied, ...overrides };
   for (const key of ['account', 'partition']) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(config[key] ?? '')) {
+    if (typeof config[key] !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(config[key])) {
       throw new Error(`Configuration field ${key} must be a nonempty account or partition name.`);
     }
   }
   for (const key of ['gpus', 'cpus']) {
     if (!Number.isSafeInteger(config[key]) || config[key] < 1) throw new Error(`${key} must be a positive integer.`);
   }
-  if (!/^\d+[MG]$/.test(config.memory) || parseInt(config.memory) < 1) throw new Error('memory must use a positive M or G value, such as 24G.');
-  if (!/^\d{2,3}:[0-5]\d:[0-5]\d$/.test(config.time) || !/[1-9]/.test(config.time)) throw new Error('time must be a positive HH:MM:SS value.');
+  if (typeof config.memory !== 'string' || !/^\d+[MG]$/.test(config.memory) || parseInt(config.memory) < 1) throw new Error('memory must use a positive M or G value, such as 24G.');
+  if (typeof config.time !== 'string' || !/^\d{2,3}:[0-5]\d:[0-5]\d$/.test(config.time) || !/[1-9]/.test(config.time)) throw new Error('time must be a positive HH:MM:SS value.');
   return Object.fromEntries(['account', ...Object.keys(DEFAULT_RESOURCES)].map(key => [key, config[key]]));
+}
+
+export function readConnectConfig(path, overrides = {}) {
+  return resolveConnectConfig(JSON.parse(readFileSync(path, 'utf8')), overrides);
 }
 
 export function buildSubmitCommand(config, name) {
@@ -61,8 +68,12 @@ export function parseManagedQueue(body, name, jobId) {
 export async function connect(options, {
   remote = runRemote, sleep = delay, now = Date.now, progress = () => {},
 } = {}) {
-  const { config, host, timeout, signal } = options;
+  const { host, timeout, signal } = options;
+  let config = options.config;
   validateOptions({ jobId: '1', host, timeout });
+  if (options.retryUnsubmitted !== undefined && !/^gldev-[a-f0-9]{24}$/.test(options.retryUnsubmitted)) {
+    throw new Error('--retry-unsubmitted must identify the exact unsubmitted request name.');
+  }
   const interval = options.pollInterval ?? 30;
   const waitTimeout = options.waitTimeout ?? 1800;
   if (!Number.isInteger(interval) || interval < 15 || interval > 300) throw new Error('Poll interval must be 15 to 300 seconds.');
@@ -75,7 +86,74 @@ export async function connect(options, {
       return parseManagedQueue(body, state.name, state.jobId);
     };
     let state = loadState(statePath);
+    if (options.retryUnsubmitted && (state?.phase !== 'submitting' || state.name !== options.retryUnsubmitted)) {
+      throw new QueryError('IDENTITY_MISMATCH', 'The confirmed unsubmitted request does not match saved submitting state. No new job was submitted.');
+    }
     let job = state ? query(state) : null; // A query error always stops here.
+    if (options.reuseManaged && state && (job || state.phase === 'submitting')) {
+      const keys = ['account', 'partition', 'gpus', 'cpus', 'memory', 'time'];
+      if (!state.config || !keys.every(key => Object.hasOwn(state.config, key))) {
+        throw new QueryError('INVALID_SAVED_CONFIG', 'The managed request lacks a complete resource configuration. State retained; no new job was submitted.');
+      }
+      config = resolveConnectConfig(state.config);
+      progress(`Using saved resources for ${state.name}: ${config.gpus} GPU, ${config.cpus} CPUs, ${config.memory}, ${config.time}; account ${config.account}, partition ${config.partition}.`);
+    }
+    const submitRecorded = request => {
+      checkAbort();
+      let response;
+      try {
+        response = remote(options, buildRecordedSubmission(request.config, request.name, buildSubmitCommand(request.config, request.name))).body;
+      } catch (error) {
+        throw new QueryError('SUBMISSION_UNKNOWN', `${error.message} Request ${request.name} is retained. Rerun the same connect command to recover its remote submission record. State: ${statePath}`);
+      }
+      if (response.startsWith('REJECTED\n')) {
+        const rejectionReason = response.slice('REJECTED\n'.length);
+        saveState(statePath, { ...request, phase: 'rejected', rejectionReason });
+        throw new QueryError('SUBMISSION_REJECTED', `Slurm rejected the resource request:\n${rejectionReason}\nAdjust resources or retry later using connect. No JobID was created.`);
+      }
+      if (!/^[1-9]\d*$/.test(response)) throw new QueryError('SUBMISSION_UNKNOWN', 'Unexpected recorded submission response; request retained.');
+      const accepted = { ...request, phase: 'active', jobId: response };
+      saveState(statePath, accepted);
+      return accepted;
+    };
+    if (state?.phase === 'submitting' && !job && state.remoteSubmissionVersion === 1) {
+      // Inspect old receipt BEFORE comparing this invocation's resource values.
+      // A confirmed rejection is terminal and permits a new configuration.
+      const receipt = remote(options, buildRecordedSubmission(state.config, state.name, '', { probeOnly: true })).body;
+      if (receipt.startsWith('REJECTED\n')) {
+        state = { ...state, phase: 'rejected', rejectionReason: receipt.slice('REJECTED\n'.length) };
+        saveState(statePath, state);
+      } else if (receipt === 'UNRESOLVED') {
+        throw new QueryError('SUBMISSION_UNKNOWN', `Remote receipt for ${state.name} is still unresolved; no new job was submitted.`);
+      } else if (receipt !== 'NOT_SUBMITTED' && !/^[1-9]\d*$/.test(receipt)) {
+        throw new QueryError('SUBMISSION_UNKNOWN', 'Unexpected remote receipt; no new job was submitted.');
+      }
+    }
+    if (state?.phase === 'rejected') {
+      if (job) throw new QueryError('IDENTITY_MISMATCH', 'A supposedly rejected request has a queued job. State retained; inspect before continuing.');
+      checkAbort();
+      saveState(`${statePath}.rejected-${state.name}.bak`, state);
+      progress(`Previous request ${state.name} was rejected by Slurm. Preparing a new request with the current resources.`);
+      state = null;
+      config = options.config;
+    }
+    if (state?.phase === 'submitting' && !job && state.remoteSubmissionVersion === 1) {
+      if (JSON.stringify(state.config) !== JSON.stringify(config)) throw new Error('The unresolved request uses different resources. Retry with the original resource parameters.');
+      progress(`Recovering remote submission record for ${state.name}...`);
+      state = submitRecorded(state);
+      job = query(state);
+      if (!job) throw new QueryError('JOB_NOT_VISIBLE', `Recovered JobID ${state.jobId}, but it is not in the queue. Check sacct; no replacement was submitted during this invocation.`);
+    }
+    if (state?.phase === 'submitting' && !job) {
+      if (options.retryUnsubmitted !== state.name) {
+        throw new QueryError('SUBMISSION_UNKNOWN', `Previous submission result is unknown. Inspect squeue/sacct for job name ${state.name}. If you have confirmed it was never submitted, retry with --retry-unsubmitted ${state.name}. No new job was submitted. State: ${statePath}`);
+      }
+      checkAbort();
+      const backup = `${statePath}.unsubmitted-${state.name}.bak`;
+      saveState(backup, state);
+      progress(`Confirmed unsubmitted request ${state.name}; saved backup: ${backup}. Preparing a new request.`);
+      state = null;
+    }
     if (state?.phase === 'stopping' && job) throw new QueryError('CANCEL_PENDING', 'The managed job is stopping. Run stop to confirm release before connecting again.');
     if (state && job) {
       if (JSON.stringify(state.config) !== JSON.stringify(config)) throw new Error('The managed allocation uses different resources. Cancel it before changing the preset.');
@@ -84,26 +162,19 @@ export async function connect(options, {
         saveState(statePath, state);
       }
       progress(`Reusing job ${job.jobId} (${job.state}).`);
-    } else if (state?.phase === 'submitting') {
-      throw new QueryError('SUBMISSION_UNKNOWN', `Previous submission result is unknown. Inspect squeue/sacct for job name ${state.name}. No new job was submitted. State: ${statePath}`);
     } else if (state && state.phase !== 'stopping' && now() - state.createdAt < 60000) {
       throw new QueryError('JOB_NOT_VISIBLE', 'The recently submitted job is not visible yet. Retry connect shortly; no new job was submitted.');
     } else {
       checkAbort();
-      state = { version: 1, phase: 'submitting', name: `gldev-${randomUUID().replaceAll('-', '').slice(0, 24)}`, config, createdAt: now() };
+      // Finish VPN/SSH/Okta checks before persisting any new submission intent.
+      // Failure here cannot have submitted a job: the only remote command is true.
+      progress('Checking login connection before submitting resources...');
+      remote(options, 'true');
+      checkAbort();
+      state = { version: 1, remoteSubmissionVersion: 1, phase: 'submitting', name: `gldev-${randomUUID().replaceAll('-', '').slice(0, 24)}`, config, createdAt: now() };
       saveState(statePath, state); // Persist intent before the network mutation.
       progress(`Submitting ${state.name}: ${config.gpus} GPU, ${config.cpus} CPUs, ${config.memory}, ${config.time}.`);
-      let response;
-      try {
-        response = remote(options, buildSubmitCommand(config, state.name)).body;
-        if (!/^[1-9]\d*$/.test(response)) throw new Error('Unexpected sbatch response.');
-      } catch (error) {
-        // Even a timeout can occur after Slurm accepted the job. Reconcile by name
-        // on the next invocation instead of blindly submitting a second request.
-        throw new QueryError('SUBMISSION_UNKNOWN', `${error.message} Submission may have succeeded. Rerun connect to reconcile job name ${state.name}; do not submit manually. State: ${statePath}`);
-      }
-      state = { ...state, phase: 'active', jobId: response };
-      saveState(statePath, state);
+      state = submitRecorded(state);
       progress(`Submitted job ${state.jobId}. State: ${statePath}`);
     }
     const started = now();

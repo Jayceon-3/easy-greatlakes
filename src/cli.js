@@ -11,6 +11,10 @@ const HELP = `Great Lakes development tool (run in local WSL, Node.js >= 20)
 Usage:
   gl-dev connect [--config gl-dev.config.json] [--no-wait] [--json] [--skip-ssh-update] [--prepare-ssh]
                  [--poll-interval 30] [--wait-timeout 1800] [--state-dir PATH]
+                 [--account ACCOUNT] [--partition PARTITION] [--gpus N] [--cpus N]
+                 [--memory 24G] [--time HH:MM:SS] [--dry-run]
+                 [--retry-unsubmitted EXACT_REQUEST_NAME]
+                 [--reuse-managed]
   gl-dev stop [--job-id EXPECTED_ID] [--no-wait] [--json]
               [--poll-interval 15] [--wait-timeout 120] [--state-dir PATH]
   gl-dev status [JobID] [--host gl-login] [--json] [--timeout 120]
@@ -18,17 +22,27 @@ Usage:
 
 Examples:
   npm run gl-dev -- connect
+  node bin/gl-dev.js connect --gpus 2 --cpus 8 --memory 48G --time 06:00:00
+  node bin/gl-dev.js connect --dry-run --json
   node bin/gl-dev.js status
   npm run gl-dev -- status 66262642
   node bin/gl-dev.js status 66262642 --json
 
 Query the current user's Slurm queue using existing SSH settings and normal Okta authentication.
 --timeout limits each SSH operation in seconds, including authentication (default: 120).
-connect submits/reuses a managed job, waits for its node, and updates gl-compute HostName.
+connect displays requested resources, submits/reuses a managed job, waits for its node, and updates gl-compute HostName.
+Resource precedence: built-in defaults < --config file < command-line resource flags.
+--dry-run prints validated resources and exits without SSH or job/state changes.
+--retry-unsubmitted NAME confirms that an unresolved request was never submitted.
+It checks the queue first, then backs up the old record before retrying if absent.
+Resource overrides apply only to this invocation; the configuration file is not modified.
+--reuse-managed prefers the saved resources of a valid managed job or unresolved request.
+It cannot be combined with resource overrides or --dry-run; defaults apply if a new allocation is needed.
 --prepare-ssh authenticates the compute node in the current terminal before Remote SSH opens.
 The SSH update uses --ssh-config or ~/.ssh/config, with validation and a backup. VS Code is not opened yet.
 stop cancels only the saved managed job, after checking its ID, name, and remote owner.
 status without a JobID inspects the saved managed job; explicit JobIDs must be ordinary integers.
+Managed status also displays saved requested resources, not live allocated resources.
 stop and status do not modify SSH settings.
 Ctrl+C stops waiting and retains the job. Use gl-dev stop to release the managed allocation.
 Exit codes: 0 = command succeeded (check released/ready fields); 1 = operation failed; 2 = invalid arguments; 130 = interrupted.`;
@@ -41,6 +55,15 @@ export function main(argv, { query = queryStatus, managedQuery = queryManagedSta
       allowPositionals: true,
       options: {
         config: { type: 'string', default: 'gl-dev.config.json' },
+        account: { type: 'string' },
+        partition: { type: 'string' },
+        gpus: { type: 'string' },
+        cpus: { type: 'string' },
+        memory: { type: 'string' },
+        time: { type: 'string' },
+        'dry-run': { type: 'boolean', default: false },
+        'retry-unsubmitted': { type: 'string' },
+        'reuse-managed': { type: 'boolean', default: false },
         'no-wait': { type: 'boolean', default: false },
         'poll-interval': { type: 'string' },
         'wait-timeout': { type: 'string' },
@@ -62,6 +85,16 @@ export function main(argv, { query = queryStatus, managedQuery = queryManagedSta
     if (values['prepare-ssh'] && (positionals[0] !== 'connect' || values['skip-ssh-update'])) throw new Error('--prepare-ssh requires connect with SSH updates enabled.');
     if (values['skip-ssh-update'] && positionals[0] !== 'connect') throw new Error('--skip-ssh-update is only supported by connect.');
     if (values['job-id'] && positionals[0] !== 'stop') throw new Error('--job-id is only supported by stop.');
+    const resourceKeys = ['account', 'partition', 'gpus', 'cpus', 'memory', 'time'];
+    if (values['reuse-managed'] && (positionals[0] !== 'connect' || values['dry-run'] || resourceKeys.some(key => values[key] !== undefined))) {
+      throw new Error('--reuse-managed requires connect without resource overrides or --dry-run.');
+    }
+    if (values['retry-unsubmitted'] !== undefined && (positionals[0] !== 'connect' || !/^gldev-[a-f0-9]{24}$/.test(values['retry-unsubmitted']))) {
+      throw new Error('--retry-unsubmitted requires connect and an exact gldev request name.');
+    }
+    if (positionals[0] !== 'connect' && (values['dry-run'] || resourceKeys.some(key => values[key] !== undefined))) {
+      throw new Error('Resource overrides and --dry-run are only supported by connect.');
+    }
     if (positionals[0] === 'stop') {
       if (positionals.length !== 1) throw new Error('Usage: gl-dev stop [options].');
       validateOptions({ jobId: values['job-id'] ?? '1', host: values.host, timeout: Number(values.timeout) });
@@ -76,13 +109,30 @@ export function main(argv, { query = queryStatus, managedQuery = queryManagedSta
     }
     if (positionals[0] === 'connect') {
       if (positionals.length !== 1) throw new Error('Usage: gl-dev connect [options].');
-      const config = readConnectConfig(values.config);
+      const overrides = {};
+      for (const key of resourceKeys) {
+        if (values[key] === undefined) continue;
+        if (['gpus', 'cpus'].includes(key)) {
+          if (!/^[1-9]\d*$/.test(values[key])) throw new Error(`--${key} must be a positive integer.`);
+          overrides[key] = Number(values[key]);
+        } else overrides[key] = values[key];
+      }
+      const config = readConnectConfig(values.config, overrides);
       validateOptions({ jobId: '1', host: values.host, timeout: Number(values.timeout) });
       const pollInterval = Number(values['poll-interval'] ?? '30');
       const waitTimeout = Number(values['wait-timeout'] ?? '1800');
       if (!Number.isInteger(pollInterval) || pollInterval < 15 || pollInterval > 300) throw new Error('Poll interval must be 15 to 300 seconds.');
       if (!Number.isInteger(waitTimeout) || waitTimeout < 0 || waitTimeout > 86400) throw new Error('Wait timeout must be 0 to 86400 seconds.');
+      const summary = `Account: ${config.account}\nPartition: ${config.partition}\nGPUs: ${config.gpus}\nCPUs: ${config.cpus}\nCPU memory: ${config.memory}\nTime limit: ${config.time}`;
+      if (values['dry-run']) {
+        out(values.json ? JSON.stringify(config, null, 2)
+          : summary);
+        return 0;
+      }
+      err(values['reuse-managed'] ? 'Checking for an existing managed job before using default resources...' : `Requested resources:\n${summary}`);
       return finishManaged('connect', {
+        retryUnsubmitted: values['retry-unsubmitted'],
+        reuseManaged: values['reuse-managed'],
         config, prepareSsh: values['prepare-ssh'], skipSshUpdate: values['skip-ssh-update'], host: values.host, timeout: Number(values.timeout), sshConfig: values['ssh-config'],
         noWait: values['no-wait'], stateDir: values['state-dir'], pollInterval, waitTimeout,
       }, values.json, { run: runConnect, updateSsh, prepareSsh, out, err });
@@ -124,6 +174,12 @@ function printStatus(result, out) {
   if (result.found) {
     out(`Elapsed: ${result.elapsed}\nTime limit: ${result.timeLimit}\nTime left: ${result.timeLeft}\nReason: ${result.reason}`);
   } else if (result.note) out(result.note);
+  if (Object.hasOwn(result, 'requestedConfig')) {
+    const config = result.requestedConfig;
+    out(config
+      ? `Requested resources (saved at submission):\nAccount: ${config.account}\nPartition: ${config.partition}\nGPUs: ${config.gpus}\nCPUs: ${config.cpus}\nCPU memory: ${config.memory}\nRequested time limit: ${config.time}`
+      : 'Requested resources: unavailable in the saved job record.');
+  }
 }
 
 async function finishManaged(action, options, json, { run, updateSsh, prepareSsh, out, err }) {

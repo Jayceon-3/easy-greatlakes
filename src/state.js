@@ -18,8 +18,9 @@ export function loadState(path) {
   try {
     const state = JSON.parse(readFileSync(path, 'utf8'));
     if (state.version !== 1 || !/^gldev-[a-f0-9]{24}$/.test(state.name ?? '') ||
-        !['submitting', 'active', 'stopping'].includes(state.phase) || !Number.isFinite(state.createdAt) ||
-        (state.phase !== 'submitting' && !/^[1-9]\d*$/.test(state.jobId ?? ''))) {
+        !['submitting', 'active', 'stopping', 'rejected'].includes(state.phase) || !Number.isFinite(state.createdAt) ||
+        (!['submitting', 'rejected'].includes(state.phase) && !/^[1-9]\d*$/.test(state.jobId ?? '')) ||
+        (state.phase === 'rejected' && (state.jobId !== undefined || typeof state.rejectionReason !== 'string'))) {
       throw new Error('Invalid saved state; inspect it before continuing.');
     }
     return state;

@@ -8,6 +8,7 @@ import { queryManagedStatus } from '../src/managed-status.js';
 import { main } from '../src/cli.js';
 
 const name = `gldev-${'a'.repeat(24)}`;
+const resources = { account: 'custom_class', partition: 'custom_gpu', gpus: 2, cpus: 8, memory: '48G', time: '06:00:00' };
 async function fixture(t, state) {
   const stateDir = mkdtempSync(join(tmpdir(), 'gl-managed-status-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
@@ -129,4 +130,63 @@ test('managed query failure emits an error rather than a false ended status', as
   assert.equal(code, 1);
   assert.deepEqual(output, []);
   assert.equal(JSON.parse(errors[0]).error.code, 'SSH_FAILED');
+});
+
+test('status reports submitted resources in running, pending and absent jobs without altering state', async t => {
+  const { options, statePath } = await fixture(t, { config: resources });
+  const before = readFileSync(statePath, 'utf8');
+  for (const state of ['RUNNING', 'PENDING', 'NOT_IN_QUEUE']) {
+    const result = await queryManagedStatus(options, {
+      remote: () => ({ body: state === 'NOT_IN_QUEUE' ? '' : `12345|${state}|gl1504|${name}|None|0:05|3:00:00|2:59:55` }),
+    });
+    assert.deepEqual(result.requestedConfig, resources);
+    // Live time limit can differ; retain the original requested runtime.
+    if (result.found) assert.equal(result.timeLimit, '3:00:00');
+    assert.equal(readFileSync(statePath, 'utf8'), before);
+    const stdout = [];
+    assert.equal(await main(['status', '--json'], {
+      managedQuery: async () => result, out: text => stdout.push(text), err: text => assert.fail(text),
+    }), 0);
+    assert.deepEqual(JSON.parse(stdout[0]).requestedConfig, resources);
+    const text = [];
+    await main(['status'], { managedQuery: async () => result, out: line => text.push(line), err: line => assert.fail(line) });
+    assert.match(text.join('\n'), /Requested resources \(saved at submission\)/);
+    assert.match(text.join('\n'), /GPUs: 2/);
+    assert.match(text.join('\n'), /CPU memory: 48G/);
+    assert.match(text.join('\n'), /Requested time limit: 06:00:00/);
+  }
+});
+
+test('legacy or invalid resource snapshots are unavailable, without synthesizing defaults', async t => {
+  for (const config of [undefined, null, {}, { account: 'example' }, { ...resources, gpus: 0 }]) {
+    const { options } = await fixture(t, { config });
+    const result = await queryManagedStatus(options, { remote: () => ({ body: '' }) });
+    assert.equal(result.requestedConfig, null);
+    const output = [];
+    await main(['status'], { managedQuery: async () => result, out: text => output.push(text), err: text => assert.fail(text) });
+    assert.match(output.join('\n'), /Requested resources: unavailable/);
+  }
+});
+
+test('unresolved submissions retain resource snapshots and explicit ID queries do not gain managed config', async t => {
+  const { options } = await fixture(t, { phase: 'submitting', jobId: undefined, config: resources });
+  const result = await queryManagedStatus(options, { remote: () => ({ body: '' }) });
+  assert.equal(result.state, 'SUBMISSION_UNKNOWN');
+  assert.deepEqual(result.requestedConfig, resources);
+  const output = [];
+  assert.equal(main(['status', '99999', '--json'], {
+    managedQuery: () => assert.fail('must not read managed state'),
+    query: () => ({ jobId: '99999', state: 'NOT_IN_QUEUE', found: false }),
+    out: text => output.push(text), err: text => assert.fail(text),
+  }), 0);
+  assert.equal(Object.hasOwn(JSON.parse(output[0]), 'requestedConfig'), false);
+});
+
+test('definitively rejected request is distinct from unresolved submission', async t => {
+  const { options } = await fixture(t, { phase: 'rejected', jobId: undefined, config: resources, rejectionReason: 'Job violates accounting/QOS policy' });
+  const result = await queryManagedStatus(options, { remote: () => ({ body: '' }) });
+  assert.equal(result.state, 'SUBMISSION_REJECTED');
+  assert.equal(result.found, false);
+  assert.deepEqual(result.requestedConfig, resources);
+  assert.match(result.note, /accounting\/QOS/);
 });
