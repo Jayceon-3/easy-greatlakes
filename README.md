@@ -2,9 +2,34 @@
 
 A VS Code extension project that automates the Great Lakes development connection workflow using Windows, WSL, SSH, and Slurm. The CLI prototype supports `gl-dev status`, `gl-dev connect`, and `gl-dev stop` for querying, preparing, and releasing a managed GPU allocation.
 
+## Connection workflow
+
+```text
+本地 Windows / WSL
+        │
+        │ SSH 登录、密码 / Okta
+        ▼
+Great Lakes 登录节点：gl-login
+        │
+        │ 提交 sbatch，等待 Slurm 分配资源
+        ▼
+得到 JobID 和计算节点，例如 gl1504
+        │
+        │ 更新 gl-compute → gl1504
+        │ 经 gl-login 跳转，建立计算节点 SSH
+        ▼
+计算节点连接准备完成
+        │
+        │ VS Code Remote SSH
+        ▼
+启动 VS Code Server，打开远程项目目录
+```
+
+`gl-dev connect --prepare-ssh` prepares the allocation and authenticates/verifies the compute-node SSH connection. The CLI does not open a VS Code window. **Connect and Open Project** in the extension completes the full workflow above; **Open gl-compute Project** opens the configured target without requesting resources. The node name `gl1504` is illustrative and changes with the allocation.
+
 ## VS Code extension
 
-Install `vscode-extension/easy-greatlakes-0.2.4.vsix` locally in Windows VS Code via **Extensions → … → Install from VSIX…**. It can be used from a WSL workspace window, while its UI-side code runs locally.
+Install `vscode-extension/easy-greatlakes-0.2.5.vsix` locally in Windows VS Code via **Extensions → … → Install from VSIX…**. It can be used from a WSL workspace window, while its UI-side code runs locally.
 
 - **Great Lakes: Release Resources** queries the managed job, confirms its JobID/node, then runs `stop --job-id` in WSL and reports release status.
 - **Great Lakes: Stop Waiting for Connect** clears a stuck local wait without cancelling jobs.
@@ -64,6 +89,8 @@ node bin/gl-dev.js status --json
 
 The result includes JobID, managed job name, state, node, elapsed time, time limit, time left, and queue reason. It verifies both the saved JobID (when available) and managed job name against one queue snapshot. It does not select unrelated or manually submitted jobs. If Connect used a different `--host`, `--ssh-config`, or `--state-dir`, supply the same options for managed status.
 
+Managed status also displays the six requested resources saved at submission: account, partition, GPU count, CPU count, CPU memory, and requested runtime. `--json` includes these under `requestedConfig`. This snapshot includes that invocation's CLI overrides; it is not read from the current configuration file and does not describe live allocated resources. If an older record lacks a complete valid snapshot, status reports the resources as unavailable (`requestedConfig: null`) rather than filling in defaults. Saved resources remain visible for a recorded job that is no longer in the queue or whose submission is unresolved. Explicit `status JOB_ID` continues to query queue status only, without attaching another job's saved resources.
+
 `NO_MANAGED_JOB` means there is no saved allocation; it does not mean the user's entire queue is empty. `NOT_IN_QUEUE` means the saved job is absent, without inferring whether it completed, expired, or was cancelled. `SUBMISSION_UNKNOWN` means a previous submission is unresolved. All three include an explanatory note. Failed queries produce errors rather than an ended status. Managed status preserves the saved job record and SSH settings, and never submits or cancels jobs. It shares the connect/stop state lock, so an operation already in progress can temporarily block it.
 
 ## Status and errors
@@ -109,7 +136,58 @@ npm run gl-dev -- connect
 
 The command reads `gl-dev.config.json`, which contains the current account `eecs442f26_class`, partition `spgpu`, 1 GPU, 4 CPUs, 24G CPU memory, and a 3-hour runtime. Use `--config PATH` for another JSON configuration. This implementation generates its own sbatch request using `--wrap='sleep infinity'`; it does not modify or execute the existing `~/vscode_gpu.sh`.
 
+Override resources for a single invocation without editing the config file:
+
+```bash
+node bin/gl-dev.js connect --gpus 2 --cpus 8 --memory 48G --time 06:00:00
+# Account/partition can also be overridden with values permitted by your cluster:
+node bin/gl-dev.js connect --account YOUR_ACCOUNT --partition YOUR_PARTITION --time 02:00:00
+
+# Preview the effective resources; no SSH, allocation, state changes or SSH updates:
+node bin/gl-dev.js connect --dry-run
+node bin/gl-dev.js connect --gpus 2 --memory 48G --dry-run --json
+```
+
+Precedence is **built-in defaults < configuration file < explicitly supplied resource flags**. Omitting resource flags preserves the existing behavior. The config file must still exist and contain a JSON object; a valid account must be supplied by that file or `--account`. Only the merged configuration is validated. Overrides never rewrite the file and are not automatically remembered for later connections.
+
+Normal `connect` displays the requested resource summary on stderr before proceeding. This also keeps stdout machine-readable with `--json`. Use `--dry-run` to preview only and exit; it does not contact SSH/Slurm, inspect existing allocations or modify job state. The former `--print-config` option has been replaced by `--dry-run`.
+
+| Resource flag | Format |
+| --- | --- |
+| `--account`, `--partition` | Nonempty names starting with a letter or digit, followed by letters, digits, `_`, `.` or `-` |
+| `--gpus`, `--cpus` | Positive integers; the allocation remains single-node |
+| `--memory` | Positive integer followed by uppercase `M` or `G`, e.g. `48G`; this is CPU memory |
+| `--time` | Positive `HH:MM:SS` (two or three hour digits), e.g. `06:00:00`; allocation runtime, not SSH timeout |
+
+These flags and `--dry-run` are supported only by `connect`. Local format validation does not establish cluster quotas, permissions or resource availability; Slurm still validates those when submitting. Preview reports the requested configuration, not whether a live allocation can be reused. If an existing managed job has different resources, Connect refuses without cancelling it or submitting a replacement. Repeat the same overrides when reconnecting to a custom allocation, or explicitly release it before requesting a different configuration. Reconnecting does not restart or extend its runtime.
+
+The extension's **Connect and Open Project** uses `--reuse-managed`: a valid managed job takes precedence over default resource values, using the resource snapshot saved when it was submitted. The same behavior is available in the CLI:
+
+```bash
+node bin/gl-dev.js connect --reuse-managed --prepare-ssh
+```
+
+Selection happens under the state lock. If no valid job exists, defaults apply; query failures and unresolved submissions retain the existing recovery safeguards. This option cannot be combined with explicit resource overrides or `--dry-run`. Ordinary CLI Connect without this option keeps strict resource matching.
+
 `connect` tracks one allocation per SSH host/config scope in `~/.local/state/easy-greatlakes`. It reuses its own pending or running job. Existing manually submitted jobs are not adopted; running connect for the first time may therefore create an additional allocation. Use the same host, SSH config, and state directory on subsequent runs to recover the same job.
+
+Before creating a new submission record, Connect checks the login connection with a harmless remote `true` command so VPN/login/Okta failures or interruptions during that check do not leave an uncertain submission behind. After connectivity is restored, rerun Connect normally. A failure during the actual `sbatch` call still retains uncertain state because the cluster may already have accepted the job.
+
+New requests also keep a remote receipt under the login user's `~/.local/state/easy-greatlakes/requests/REQUEST_NAME/`. The remote shell requires Bash and `flock`; failure to acquire the request lock prevents submission. Each receipt stores the resource fingerprint and a `submitting` or `accepted JOB_ID` status. Acceptance is written by atomic rename before the JobID is returned over SSH. Requests are tagged locally so old unrecorded submissions are not mistaken for new requests that have never reached the remote shell.
+
+After interruption, rerun **the same Connect command with the same resource parameters**. Connect checks the queue first. If the new request is absent from the queue, it replays the recorded submission under the same remote lock: an accepted receipt returns the original JobID without invoking `sbatch`; no submission status yet means it can safely proceed for that same request. An active remote lock means the original operation is still running, so retry later. The request name is preserved rather than generating a new allocation on each network retry. If a recovered accepted job is absent from the queue, its ID is saved and reported for inspection without submitting a replacement in that invocation.
+
+A receipt left at `submitting` is still ambiguous: a process may have died between writing intent and executing `sbatch`, or after Slurm acceptance but before recording the ID. If the queue also cannot resolve it, Connect retains the record and stops. This prevents duplicate submission but is not an exactly-once guarantee across cluster/storage failures. Do not remove remote receipts or their lock files during recovery. Receipts are retained after release. Older unresolved requests have no trustworthy remote receipt and still require explicit confirmation as described below; the new protocol cannot reconstruct missing evidence from earlier versions.
+
+Explicit controller rejections are handled separately. When `sbatch` fails without returning a JobID and reports a recognized policy/account/partition/time/resource rejection, the remote receipt stores `rejected` plus the original error. Connect reports `SUBMISSION_REJECTED`, and managed status displays the rejection reason and saved request configuration. A subsequent ordinary Connect may use different resource parameters: it checks the queue, archives the rejected local record and creates a new request. It never retries a rejected request automatically within the same invocation. If the rejection response was lost over SSH, Connect inspects the remote receipt before comparing resource parameters, so a confirmed rejection does not trap the user in an unresolved-config mismatch. Transport timeouts, malformed responses and unrecognized errors remain unresolved rather than being treated as confirmed rejections.
+
+For an older unresolved request that you have independently confirmed was **never submitted**, use its exact saved request name:
+
+```bash
+node bin/gl-dev.js connect --gpus 2 --retry-unsubmitted gldev-0123456789abcdef01234567
+```
+
+Replace the example with the actual `gldev-` name shown in the error, including its 24 hexadecimal characters. This option is your explicit confirmation that the old submission never happened, not an automatic inference from an empty queue. Connect first queries the queue: a matching job is reused, a query failure stops recovery, and a mismatched local request is rejected. If no match exists, it saves a `.bak` copy of the original state alongside the state file and prepares a new request. Queue absence alone is insufficient confirmation, since jobs can disappear from the queue or finish before recovery. This option does not cancel jobs or terminate SSH connections. `--dry-run` continues to preview resources only, including when this option is supplied.
 
 The command polls every 30 seconds, for up to 30 minutes by default. When RUNNING with a single assigned node, it prints the JobID and node. If the waiting limit is reached, it returns the pending job with `ready: false`; run connect again to continue. `--timeout` limits each SSH operation, including authentication; `--wait-timeout` limits the polling period, checked between SSH operations.
 

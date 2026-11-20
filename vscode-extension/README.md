@@ -1,6 +1,6 @@
 # Great Lakes (Local Prototype)
 
-Version 0.2.4 provides four commands:
+Version 0.2.5 provides four commands:
 
 - **Great Lakes: Open gl-compute Project**: open the existing host and saved directory without invoking the CLI or changing SSH settings.
 - **Great Lakes: Release Resources** queries the managed job, confirms its JobID/node, then runs `stop --job-id` in WSL and reports release status.
@@ -9,7 +9,7 @@ Version 0.2.4 provides four commands:
 
 ## Installation and settings
 
-Install `easy-greatlakes-0.2.4.vsix` locally in Windows VS Code using **Extensions → … → Install from VSIX…**. Install/enable Remote - SSH locally as well. Commands can be invoked from a WSL workspace window: the extension itself runs on the local UI side.
+Install `easy-greatlakes-0.2.5.vsix` locally in Windows VS Code using **Extensions → … → Install from VSIX…**. Install/enable Remote - SSH locally as well. Commands can be invoked from a WSL workspace window: the extension itself runs on the local UI side.
 
 Keep the working `remote.SSH.path` and `remote.SSH.configFile` settings and Windows → WSL wrapper. The extension does not generate or change those settings. In the Windows file picker, this repository is available at `\\wsl.localhost\Ubuntu-22.04\home\jason\easy-greatlakes`.
 
@@ -100,3 +100,11 @@ After confirmation, a Great Lakes Release terminal runs `stop --json --job-id CO
 Connect and Release cannot run concurrently in the same extension instance. CLI locks protect state operations across windows, and the confirmed JobID protects against a changed allocation during the confirmation dialog. Release cancels processes in the target allocation and may disconnect its remote sessions. It does not terminate SSH masters or close VS Code windows. **Stop Waiting for Connect** continues to affect only Connect monitoring.
 
 The CLI now also accepts `node bin/gl-dev.js status --json` without a JobID to inspect the saved managed allocation. Explicit `status JOB_ID` remains supported. Tests cover confirmed/cancelled release, missing and pending jobs, query errors, mismatched results, frozen WSL settings, and strict bridge JSON validation. Real cancellation via this new UI remains a user-side integration check.
+
+## Prefer the current allocation in 0.2.5
+
+**Connect and Open Project** now calls `connect --json --prepare-ssh --reuse-managed`. The CLI checks the managed job under its existing state lock and uses its saved resources when the job is valid. This supports allocations created with custom CLI flags even when the repository defaults differ. Existing pending jobs are retained and waited on; running jobs have SSH prepared and verified before the project opens. A healthy shared SSH connection can be reused during preparation without fresh authentication.
+
+If there is no valid allocation, the CLI uses the configured defaults for a new request, subject to its existing recently-invisible-job and unresolved-submission safeguards. A definite rejection also permits a new request with defaults. Unresolved requests recover using their saved configuration and the remote receipt protocol. Failed queries, invalid saved resources and jobs that are stopping never trigger a new allocation. This command does not cancel jobs, resize them or extend their runtime. The original Open command remains unchanged.
+
+Install the 0.2.5 VSIX locally in Windows VS Code and reload the initiating window when ready. Tests simulate custom-allocation reuse, pending jobs, absent/ended allocations and query failures; actual Windows/WSL/Remote SSH validation remains a user-side check.
