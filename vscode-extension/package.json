@@ -3,7 +3,7 @@
   "displayName": "Great Lakes (Local Prototype)",
   "description": "Prepare a Great Lakes allocation through WSL and open its project with Remote SSH.",
   "publisher": "easy-greatlakes-local",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "license": "UNLICENSED",
   "engines": {
     "vscode": "^1.85.0"

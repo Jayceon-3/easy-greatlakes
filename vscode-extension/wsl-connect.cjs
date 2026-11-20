@@ -9,7 +9,7 @@ function buildRequest(settings, id = randomUUID(), { action = 'connect', expecte
   if (!['connect', 'status', 'stop'].includes(action)) throw new Error('Invalid CLI action.');
   if (action === 'stop' && !/^[1-9]\d*$/.test(expectedJobId ?? '')) throw new Error('Release requires an explicit JobID.');
   const label = action === 'connect' ? 'Connect' : action === 'stop' ? 'Release' : 'Status';
-  const command = action === 'connect' ? 'connect --json --prepare-ssh'
+  const command = action === 'connect' ? 'connect --json --prepare-ssh --reuse-managed'
     : action === 'stop' ? `stop --json --job-id ${quote(expectedJobId)}` : 'status --json';
   const distribution = settings.get('wslDistribution', 'Ubuntu-22.04');
   const user = settings.get('wslUser', 'jason');

@@ -35,6 +35,7 @@ test('bridge uses the configured WSL identity and existing CLI without changing 
   assert.equal(request.user, 'jason');
   assert.equal(request.directory, '\\\\wsl.localhost\\Ubuntu-22.04\\tmp\\gl-dev-extension-abcd-1234');
   assert.match(request.script, /node bin\/gl-dev.js connect --json/);
+  assert.match(request.script, /--prepare-ssh --reuse-managed/);
   assert.doesNotMatch(request.script, /--state-dir|--ssh-config|scancel|ssh -O/);
 });
 
